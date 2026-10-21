@@ -1013,7 +1013,7 @@ fn remote_selections(app: &SlideApp, painter: &egui::Painter, xf: Xf) {
             let a = x.affine();
             let corners = [Point::new(0.0, 0.0), Point::new(x.w, 0.0), Point::new(x.w, x.h), Point::new(0.0, x.h)].map(|q| xf.to_screen(a * q));
             poly(painter, corners, Stroke::new(2.0, col));
-            let label = if peer.typing { format!("{} ✎", peer.name) } else { peer.name.clone() };
+            let label = if peer.typing { format!("{} …", peer.name) } else { peer.name.clone() };
             let font = egui::FontId::proportional(11.0);
             let galley = painter.layout_no_wrap(label, font, egui::Color32::WHITE);
             let top = corners.iter().fold(corners[0], |m, c| if c.y < m.y || (c.y == m.y && c.x < m.x) { *c } else { m });
