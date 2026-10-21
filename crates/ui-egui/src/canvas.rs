@@ -806,6 +806,7 @@ fn overlays(app: &mut SlideApp, ui: &Ui, painter: &egui::Painter, xf: Xf, t: &To
         }
     }
     let Some(st) = app.session.active() else { return };
+    remote_selections(app, painter, xf);
     let sel_stroke = Stroke::new(1.0, t.selection);
     let editing = st.selection.text.clone();
     for id in &st.selection.shapes {
@@ -999,6 +1000,30 @@ fn overlays(app: &mut SlideApp, ui: &Ui, painter: &egui::Painter, xf: Xf, t: &To
 }
 
 /// Pressure from a touch or pen this frame (`0..=1`). A mouse reports none.
+/// What the other people in a live session selected on this slide: an outline in their colour
+/// with their name on it.
+fn remote_selections(app: &SlideApp, painter: &egui::Painter, xf: Xf) {
+    let Some(st) = app.session.active() else { return };
+    let Some(slide) = st.doc.slides.get(st.selection.slide) else { return };
+    for peer in app.peers.iter().filter(|p| p.slide == Some(slide.id.0)) {
+        let col = peer.color32();
+        for id in &peer.shapes {
+            let Some(sh) = slide.shape(deckcraft_model::ShapeId(*id)) else { continue };
+            let x = deckcraft_engine::cmd::xfrm_of(&st.doc, &st.selection, sh);
+            let a = x.affine();
+            let corners = [Point::new(0.0, 0.0), Point::new(x.w, 0.0), Point::new(x.w, x.h), Point::new(0.0, x.h)].map(|q| xf.to_screen(a * q));
+            poly(painter, corners, Stroke::new(2.0, col));
+            let label = if peer.typing { format!("{} ✎", peer.name) } else { peer.name.clone() };
+            let font = egui::FontId::proportional(11.0);
+            let galley = painter.layout_no_wrap(label, font, egui::Color32::WHITE);
+            let top = corners.iter().fold(corners[0], |m, c| if c.y < m.y || (c.y == m.y && c.x < m.x) { *c } else { m });
+            let rect = egui::Rect::from_min_size(top - egui::vec2(0.0, galley.size().y + 4.0), galley.size() + egui::vec2(8.0, 4.0));
+            painter.rect_filled(rect, 3.0, col);
+            painter.galley(rect.min + egui::vec2(4.0, 2.0), galley, egui::Color32::WHITE);
+        }
+    }
+}
+
 fn reported_pressure(ui: &Ui) -> Option<f32> {
     ui.input(|i| {
         i.events.iter().rev().find_map(|e| match e {

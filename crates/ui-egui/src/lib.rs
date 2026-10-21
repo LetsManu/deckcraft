@@ -515,6 +515,31 @@ pub struct SlideApp {
     next_file_id: u64,
     /// Picks and drops whose bytes have not arrived yet.
     pending_files: Vec<PendingFile>,
+    /// The other people editing this presentation live (set by the host each frame); their
+    /// selections show in their colour on the slide and the thumbnails.
+    pub peers: Vec<RemotePeer>,
+}
+
+/// Someone else in a live co-editing session.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RemotePeer {
+    pub name: String,
+    pub color: [u8; 3],
+    /// The slide they are on (by id) and the shapes they selected there.
+    pub slide: Option<u32>,
+    pub shapes: Vec<u32>,
+    /// They are typing in one of those shapes.
+    pub typing: bool,
+}
+
+impl RemotePeer {
+    pub fn color32(&self) -> egui::Color32 {
+        egui::Color32::from_rgb(self.color[0], self.color[1], self.color[2])
+    }
+    /// One or two letters for avatars.
+    pub fn initials(&self) -> String {
+        self.name.split_whitespace().filter_map(|w| w.chars().next()).take(2).collect::<String>().to_uppercase()
+    }
 }
 
 fn grid_options_touched(p: &Value) -> bool {
@@ -583,6 +608,7 @@ impl SlideApp {
             twisting: false,
             next_file_id: 1,
             pending_files: Vec::new(),
+            peers: Vec::new(),
         }
     }
 

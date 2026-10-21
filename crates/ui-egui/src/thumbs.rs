@@ -129,6 +129,13 @@ fn list(app: &mut SlideApp, ui: &mut Ui) {
                 need_more = true;
             }
         }
+        // Live co-editing: a dot with the initials of everyone else on this slide.
+        let mut dot = pos2(img.max.x - 9.0, img.min.y + 9.0);
+        for peer in app.peers.iter().filter(|peer| id.is_some_and(|id| peer.slide == Some(id.0))) {
+            p.circle(dot, 8.0, peer.color32(), Stroke::new(1.5, Color32::WHITE));
+            p.text(dot, Align2::CENTER_CENTER, peer.initials(), theme::font(8.0), Color32::WHITE);
+            dot.x -= 14.0;
+        }
         if selected {
             p.rect_stroke(img.expand(2.0), CornerRadius::same(4), Stroke::new(3.0, t.accent), egui::StrokeKind::Outside);
         } else {

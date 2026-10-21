@@ -64,7 +64,7 @@ pub fn start() {
                     if q.contains("show") {
                         app.start_show(0, false);
                     }
-                    Ok(Box::new(WebShell { app, inbox }))
+                    Ok(Box::new(WebShell { app, inbox, live: crate::live::Live::from_portal() }))
                 }),
             )
             .await;
@@ -86,6 +86,8 @@ fn query() -> String {
 struct WebShell {
     app: SlideApp,
     inbox: Inbox,
+    /// OfficeHub: editing together with others (`?collab=`).
+    live: Option<crate::live::Live>,
 }
 
 impl eframe::App for WebShell {
@@ -113,6 +115,9 @@ impl eframe::App for WebShell {
             });
         }
         self.app.logic(ctx);
+        if let Some(live) = self.live.as_mut() {
+            live.frame(&mut self.app, ctx);
+        }
     }
 
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {

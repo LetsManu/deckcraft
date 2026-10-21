@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+pub use deckcraft_collab::merge;
 use deckcraft_collab::Collab;
 
 use crate::{EngineError, Result, Session, clamp_selection};
