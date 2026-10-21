@@ -39,7 +39,22 @@ pub fn start() {
                     let inbox: Inbox = Inbox::default();
                     let mut app = SlideApp::new(Session::new(), services(inbox.clone(), cc.egui_ctx.clone()));
                     let q = query();
-                    if !q.contains("blank") {
+                    // OfficeHub: open the presentation the portal asked for (it arrives through the inbox).
+                    if let Some((src, name)) = crate::portal::source() {
+                        let id = app.begin_external_file("open");
+                        let inbox = inbox.clone();
+                        let ctx = cc.egui_ctx.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            match crate::portal::fetch(&src, "GET", None).await {
+                                Ok(bytes) => push_inbox(&inbox, InboxEvent::File(InboxFile { id, name, bytes })),
+                                Err(e) => {
+                                    log::error!("couldn't open the presentation from OfficeHub: {e}");
+                                    push_inbox(&inbox, InboxEvent::Cancelled { id });
+                                }
+                            }
+                            ctx.request_repaint();
+                        });
+                    } else if !q.contains("blank") {
                         if let Err(e) = deckcraft_engine::sample::open_sample(&mut app.session) {
                             log::error!("sample deck: {e}");
                         }
@@ -134,9 +149,9 @@ fn services(inbox: Inbox, ctx: egui::Context) -> Services {
                 ctx.request_repaint();
             });
         })),
-        write: Some(Box::new(|name: &str, bytes: &[u8]| download(name, bytes))),
+        write: Some(Box::new(|name: &str, bytes: &[u8]| save_or_download(name, bytes))),
         download: Some(Box::new(|name: &str, bytes: &[u8]| {
-            if let Err(e) = download(name, bytes) {
+            if let Err(e) = save_or_download(name, bytes) {
                 log::error!("download of {name} failed: {e}");
             }
         })),
@@ -147,6 +162,34 @@ fn services(inbox: Inbox, ctx: egui::Context) -> Services {
 
 fn push_inbox(inbox: &Inbox, event: InboxEvent) {
     inbox.lock().unwrap_or_else(|e| e.into_inner()).push(event);
+}
+
+/// OfficeHub: Save sends the presentation back to the portal in the portal file's format (Save in the
+/// browser produces a `.deckcraft` file, so a `.pptx` from the portal is converted back first);
+/// everything else (exports, Save As other formats) downloads as before.
+fn save_or_download(path: &str, bytes: &[u8]) -> Result<(), String> {
+    let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
+    let (Some(url), Some(target)) = (crate::portal::save_url(), crate::portal::portal_extension()) else {
+        return download(path, bytes);
+    };
+    if ext != target && ext != "deckcraft" {
+        return download(path, bytes);
+    }
+    let data = if ext == target {
+        bytes.to_vec()
+    } else {
+        let deck = deckcraft_format::load(bytes).map_err(|e| e.to_string())?;
+        deckcraft_engine::cmd::file::save_bytes(&deck, &target).map_err(|e| e.to_string())?
+    };
+    wasm_bindgen_futures::spawn_local(async move {
+        if let Err(e) = crate::portal::fetch(&url, "PUT", Some(&data)).await {
+            log::error!("{e}");
+            if let Some(w) = web_sys::window() {
+                let _ = w.alert_with_message(&e);
+            }
+        }
+    });
+    Ok(())
 }
 
 /// Trigger a browser download of `bytes` named after the last component of `path`.
