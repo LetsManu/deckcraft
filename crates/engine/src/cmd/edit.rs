@@ -45,6 +45,10 @@ pub fn specs() -> Vec<CommandSpec> {
 
 fn restore(s: &mut Session, redo: bool) -> Result<Value> {
     let st = s.doc_mut()?;
+    if let Some(r) = crate::collab::undo(st, redo) {
+        r?;
+        return ok();
+    }
     let (from, to) = if redo { (&mut st.history.redo, &mut st.history.undo) } else { (&mut st.history.undo, &mut st.history.redo) };
     let Some(e) = from.pop() else { return ok() };
     to.push(HistoryEntry { label: e.label.clone(), doc: st.doc.clone(), selection: st.selection.clone() });

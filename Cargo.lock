@@ -992,6 +992,7 @@ name = "deckcraft-engine"
 version = "0.9.0"
 dependencies = [
  "deckcraft-anim",
+ "deckcraft-collab",
  "deckcraft-color",
  "deckcraft-fonts",
  "deckcraft-format",

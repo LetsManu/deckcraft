@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod cmd;
+pub mod collab;
 pub mod compare;
 pub mod connect;
 pub mod drawtable;
@@ -222,6 +223,8 @@ pub struct DocState {
     pub composition: Option<Composition>,
     /// Review › Compare in progress: the revised copy.
     pub compare: Option<compare::Compare>,
+    /// Live co-editing (see [`collab`]); inactive unless a host connects the presentation.
+    pub shared: collab::Shared,
 }
 
 static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -249,6 +252,7 @@ impl DocState {
             missing_fonts: Vec::new(),
             composition: None,
             compare: None,
+            shared: collab::Shared::default(),
         }
     }
     pub fn is_dirty(&self) -> bool {
@@ -749,6 +753,7 @@ pub fn undo_cost(doc: &Presentation, newer: &Presentation) -> usize {
 }
 
 pub(crate) fn push_undo(st: &mut DocState, e: HistoryEntry) {
+    collab::end_step(st);
     let h = &mut st.history;
     h.costs.insert(Arc::as_ptr(&e.doc) as usize, undo_cost(&e.doc, &st.doc));
     h.undo.push(e);
