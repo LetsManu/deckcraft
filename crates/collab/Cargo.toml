@@ -1,0 +1,21 @@
+[package]
+name = "deckcraft-collab"
+description = "DeckCraft live co-editing: the presentation as a Yjs document (yrs), diffs of local edits and merges of others'"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+deckcraft-model = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+yrs = { version = "0.28", default-features = false }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+deckcraft-engine = { workspace = true }
