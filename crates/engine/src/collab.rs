@@ -39,10 +39,19 @@ impl Shared {
     }
 }
 
+/// Where the person is typing, for the shared text to put ambiguous changes at the caret.
+fn caret_of(st: &crate::DocState) -> Option<(deckcraft_model::SlideId, Option<deckcraft_model::ShapeId>, (usize, usize))> {
+    let t = st.selection.text.as_ref().filter(|t| t.cell.is_none())?;
+    let slide = st.doc.slides.get(st.selection.slide)?.id;
+    Some((slide, (!t.notes).then_some(t.shape), t.caret))
+}
+
 /// End an undo step: write it to the shared document now and start the next one.
 pub(crate) fn end_step(st: &mut crate::DocState) {
     let doc = st.doc.clone();
+    let caret = caret_of(st);
     if let Some(c) = st.shared.collab.as_mut() {
+        c.set_caret(caret);
         if let Some(u) = c.local(&doc) {
             st.shared.outbox.push(u);
         }
@@ -122,8 +131,11 @@ impl Session {
     pub fn collab_outgoing(&mut self) -> Option<Vec<u8>> {
         let st = self.active_mut()?;
         let doc = st.doc.clone();
+        let caret = caret_of(st);
         let mut out = std::mem::take(&mut st.shared.outbox);
-        if let Some(u) = st.shared.collab.as_mut()?.local(&doc) {
+        let c = st.shared.collab.as_mut()?;
+        c.set_caret(caret);
+        if let Some(u) = c.local(&doc) {
             out.push(u);
         }
         (!out.is_empty()).then(|| deckcraft_collab::merge(&out))
@@ -133,8 +145,10 @@ impl Session {
     pub fn collab_incoming(&mut self, update: &[u8]) -> Result<()> {
         let st = self.active_mut().ok_or(EngineError::NoDocument)?;
         let doc = st.doc.clone();
+        let caret = caret_of(st);
         let Some(c) = st.shared.collab.as_mut() else { return Ok(()) };
         // Our own edits first, so the caret below is counted in the text as we see it.
+        c.set_caret(caret);
         if let Some(u) = c.local(&doc) {
             st.shared.outbox.push(u);
         }
@@ -234,6 +248,25 @@ mod tests {
         sync(&mut b, &mut a);
         let text = a.active().unwrap().doc.slides[0].shapes[0].text.as_ref().unwrap().text();
         assert!(text.ends_with(" world!"), "{text:?}");
+    }
+
+    #[test]
+    fn typing_at_the_same_place_does_not_mix_the_letters() {
+        let (mut a, mut b) = two();
+        let shape = a.active().unwrap().doc.slides[0].shapes[0].id;
+        a.execute("text.edit", &json!({"id": shape.0, "end": true})).unwrap();
+        b.execute("text.edit", &json!({"id": shape.0, "end": true})).unwrap();
+        // Letter by letter, syncing after each, both at the end of the same paragraph.
+        for (x, y) in "1  4".chars().zip("a  d".chars()) {
+            a.execute("text.insert", &json!({"text": x.to_string()})).unwrap();
+            b.execute("text.insert", &json!({"text": y.to_string()})).unwrap();
+            sync(&mut a, &mut b);
+            sync(&mut b, &mut a);
+        }
+        sync(&mut a, &mut b);
+        assert!(same(&a, &b));
+        let text = a.active().unwrap().doc.slides[0].shapes[0].text.as_ref().unwrap().text();
+        assert!(text.contains("1  4") && text.contains("a  d"), "{text:?}");
     }
 
     #[test]

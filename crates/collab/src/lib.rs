@@ -90,6 +90,8 @@ pub struct Collab {
     id_ceiling: u32,
     /// Undo and redo of this participant's own edits only (others' edits stay).
     undo: UndoManager<()>,
+    /// Where this person's caret is (`texts` key and `(paragraph, char)`), for [`text::write`].
+    caret: Option<(String, (usize, usize))>,
 }
 
 impl std::fmt::Debug for Collab {
@@ -234,7 +236,14 @@ impl Collab {
             id_floor,
             id_ceiling: id_floor + ID_SPAN,
             undo,
+            caret: None,
         }
+    }
+
+    /// Where this person types (`shape: None` = the slide's notes), so a change in a run of equal
+    /// characters lands at the caret. Set it before [`Self::local`]; `None` when not typing.
+    pub fn set_caret(&mut self, at: Option<(SlideId, Option<ShapeId>, (usize, usize))>) {
+        self.caret = at.map(|(slide, shape, pos)| (text_key(slide, shape), pos));
     }
 
     /// End the current undo step: the next local edit starts a new one.
@@ -431,11 +440,12 @@ impl Collab {
 
     /// Bring the shared text `key` from `old` to `new` (created when it does not exist yet).
     fn write_text(&mut self, txn: &mut TransactionMut, key: &str, old: &[Paragraph], new: &[Paragraph]) {
+        let caret = self.caret.as_ref().filter(|(k, _)| k == key).map(|(_, pos)| *pos);
         match self.texts.get(txn, key) {
-            Some(Out::YText(t)) => text::write(txn, &t, old, new),
+            Some(Out::YText(t)) => text::write(txn, &t, old, new, caret),
             _ => {
                 let t: TextRef = self.texts.insert(txn, key, TextPrelim::new(""));
-                text::write(txn, &t, &[], new);
+                text::write(txn, &t, &[], new, None);
             }
         }
     }

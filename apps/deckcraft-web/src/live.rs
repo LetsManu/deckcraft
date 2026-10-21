@@ -422,8 +422,7 @@ async fn request(url: &str, body: &Value) -> Result<Value, String> {
     if status == 204 {
         return Ok(Value::Null);
     }
-    let text_fn: js_sys::Function =
-        js_sys::Reflect::get(&response, &"text".into()).map_err(js)?.dyn_into().map_err(|_| "no text()".to_string())?;
+    let text_fn: js_sys::Function = js_sys::Reflect::get(&response, &"text".into()).map_err(js)?.dyn_into().map_err(|_| "no text()".to_string())?;
     let promise: js_sys::Promise = text_fn.call0(&response).map_err(js)?.dyn_into().map_err(|_| "not a promise".to_string())?;
     let text = wasm_bindgen_futures::JsFuture::from(promise).await.map_err(js)?.as_string().unwrap_or_default();
     serde_json::from_str(&text).map_err(|e| e.to_string())

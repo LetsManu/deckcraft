@@ -71,18 +71,48 @@ fn units(paragraphs: &[Paragraph]) -> Vec<Unit> {
     out
 }
 
+/// The unit index of `(paragraph, char)` in `paragraphs` (as [`units`] lays them out).
+fn unit_index(paragraphs: &[Paragraph], pos: (usize, usize)) -> Option<usize> {
+    let mut i = 0;
+    for (n, p) in paragraphs.iter().enumerate() {
+        let len = p.char_len();
+        if n == pos.0 {
+            return Some(i + pos.1.min(len));
+        }
+        i += len + 1;
+    }
+    None
+}
+
 fn bytes(units: &[Unit]) -> u32 {
     units.iter().map(|u| u.ch.len_utf8() as u32).sum()
 }
 
 /// Edit the shared text from `old` into `new` with the fewest changes: the characters that
 /// differ are replaced, and formatting that differs elsewhere is applied as formatting only.
-pub(crate) fn write(txn: &mut TransactionMut, text: &TextRef, old: &[Paragraph], new: &[Paragraph]) {
+///
+/// `caret` (where the person's caret is now, as `(paragraph, char)`) decides where a change goes
+/// when the text alone cannot tell: typing a space next to another space could be either.
+pub(crate) fn write(txn: &mut TransactionMut, text: &TextRef, old: &[Paragraph], new: &[Paragraph], caret: Option<(usize, usize)>) {
     let a = units(old);
     let b = units(new);
-    let pre = a.iter().zip(&b).take_while(|(x, y)| x.ch == y.ch).count();
+    let mut pre = a.iter().zip(&b).take_while(|(x, y)| x.ch == y.ch).count();
     let max_suf = a.len().min(b.len()) - pre;
-    let suf = a.iter().rev().zip(b.iter().rev()).take(max_suf).take_while(|(x, y)| x.ch == y.ch).count();
+    let mut suf = a.iter().rev().zip(b.iter().rev()).take(max_suf).take_while(|(x, y)| x.ch == y.ch).count();
+    if let Some(caret) = caret.and_then(|c| unit_index(new, c)) {
+        // A pure insertion or deletion inside a run of equal characters may sit anywhere in it:
+        // put it where the caret says (the caret ends an insertion and marks a deletion).
+        let (short, long) = (a.len().min(b.len()), a.len().max(b.len()));
+        let span = long - short;
+        if pre + suf > short {
+            let lowest = short.saturating_sub(suf);
+            let highest = pre.min(short);
+            let wanted = if b.len() > a.len() { caret.saturating_sub(span) } else { caret };
+            let start = wanted.clamp(lowest, highest.max(lowest));
+            pre = start;
+            suf = short - start;
+        }
+    }
     let start = bytes(&b[..pre]);
     // Replace the middle.
     let removed = bytes(&a[pre..a.len() - suf]);
@@ -223,7 +253,9 @@ pub(crate) fn pos_of<T: ReadTxn>(txn: &T, text: &TextRef, index: u32) -> (usize,
 
 /// A position that moves with the text when others type before it.
 pub(crate) fn anchor<T: ReadTxn>(txn: &T, text: &TextRef, pos: (usize, usize)) -> Option<StickyIndex> {
-    text.sticky_index(txn, index_of(txn, text, pos), Assoc::After)
+    // Tied to the character before the caret, so the caret stays right after what this person typed
+    // even when someone else types at the same place.
+    text.sticky_index(txn, index_of(txn, text, pos), Assoc::Before)
 }
 
 pub(crate) fn resolve<T: ReadTxn>(txn: &T, text: &TextRef, sticky: &StickyIndex) -> Option<(usize, usize)> {
