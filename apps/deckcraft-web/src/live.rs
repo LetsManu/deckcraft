@@ -33,6 +33,11 @@ struct Shared {
     /// Asked to seed (the first person left before doing it).
     reseed: bool,
     peers: BTreeMap<String, RemotePeer>,
+    /// (slot, may save) of everyone else, to agree on who saves automatically.
+    slots: BTreeMap<String, (u32, bool)>,
+    /// Someone changed the presentation since the last automatic save (time of the last change).
+    changed_at: Option<f64>,
+    saving: bool,
     /// Waiting to be sent, in order; one request at a time.
     outbox: Vec<Vec<u8>>,
     sending: bool,
@@ -43,6 +48,8 @@ struct Shared {
 /// The live session of this page.
 pub struct Live {
     url: String,
+    /// Where an automatic save goes (`None`: this person may only look).
+    save: Option<String>,
     shared: Rc<RefCell<Shared>>,
     started: bool,
     last_presence: String,
@@ -53,7 +60,8 @@ impl Live {
     /// The session the portal asked for, if any.
     pub fn from_portal() -> Option<Self> {
         let url = crate::portal::param("collab").filter(|u| u.starts_with('/') && !u.starts_with("//"))?;
-        Some(Live { url, shared: Rc::default(), started: false, last_presence: String::new(), last_presence_at: 0.0 })
+        let save = crate::portal::save_url().map(|u| format!("{u}&auto=1"));
+        Some(Live { url, save, shared: Rc::default(), started: false, last_presence: String::new(), last_presence_at: 0.0 })
     }
 
     fn endpoint(&self, action: &str) -> String {
@@ -93,10 +101,14 @@ impl Live {
         let compact = s.compact.take();
         app.peers = s.peers.values().cloned().collect();
         drop(s);
+        let had_inbound = !inbound.is_empty();
         for u in inbound {
             if let Err(e) = app.session.collab_incoming(&u) {
                 log::error!("live editing: {e}");
             }
+        }
+        if had_inbound {
+            self.shared.borrow_mut().changed_at = Some(now);
         }
         if let (Some(upto), Some(state)) = (compact, app.session.collab_state()) {
             let body = json!({"peer_id": peer_id, "data": B64.encode(state), "upto": upto});
@@ -104,9 +116,12 @@ impl Live {
         }
         // Our changes.
         if let Some(u) = app.session.collab_outgoing() {
-            self.shared.borrow_mut().outbox.push(u);
+            let mut s = self.shared.borrow_mut();
+            s.outbox.push(u);
+            s.changed_at = Some(now);
         }
         self.pump(ctx);
+        self.autosave(app, ctx, now);
         // Where we are, for the others (at most every 150 ms, only when it changed).
         if let Some(st) = app.session.active() {
             let slide = st.doc.slides.get(st.selection.slide).map(|s| s.id.0);
@@ -126,6 +141,52 @@ impl Live {
         if std::mem::take(&mut s.failed) {
             app.notify("A change could not be sent to the others. Please check the connection.");
         }
+    }
+
+    /// Everyone's changes are saved to the file by one person: whoever may save and has the lowest
+    /// slot, a few seconds after the last change. OfficeHub keeps these saves in one version.
+    fn autosave(&mut self, app: &mut SlideApp, ctx: &egui::Context, now: f64) {
+        const QUIET: f64 = 3.0;
+        let Some(save) = self.save.clone() else { return };
+        {
+            let s = self.shared.borrow();
+            let Some(at) = s.changed_at else { return };
+            let leader = s.slots.values().filter(|(_, may)| *may).all(|(slot, _)| *slot > s.slot);
+            if s.saving || !leader || now - at < QUIET {
+                if s.changed_at.is_some() && !s.saving {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(500));
+                }
+                return;
+            }
+        }
+        let Some(target) = crate::portal::portal_extension() else { return };
+        let Some(doc) = app.session.active().map(|d| d.doc.clone()) else { return };
+        let bytes = match deckcraft_engine::cmd::file::save_bytes(&doc, &target) {
+            Ok(b) => b,
+            Err(e) => {
+                log::error!("automatic save: {e}");
+                return;
+            }
+        };
+        if let Some(st) = app.session.active_mut() {
+            st.saved_doc = doc;
+        }
+        {
+            let mut s = self.shared.borrow_mut();
+            s.saving = true;
+            s.changed_at = None;
+        }
+        let shared = self.shared.clone();
+        let ctx = ctx.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Err(e) = crate::portal::fetch(&save, "PUT", Some(&bytes)).await {
+                log::error!("automatic save: {e}");
+                // Try again after the next quiet moment.
+                shared.borrow_mut().changed_at = Some(0.0);
+            }
+            shared.borrow_mut().saving = false;
+            ctx.request_repaint();
+        });
     }
 
     /// Seed or join once hello has answered (a joiner waits for the first update).
@@ -175,6 +236,7 @@ impl Live {
                 for p in reply["peers"].as_array().into_iter().flatten() {
                     if let Some(id) = p["id"].as_str() {
                         s.peers.insert(id.to_string(), peer_of(p));
+                        s.slots.insert(id.to_string(), slot_of(p));
                     }
                 }
             }
@@ -196,10 +258,12 @@ impl Live {
                                     }
                                 }
                                 "join" => {
+                                    s.slots.insert(from.clone(), slot_of(&m["data"]));
                                     s.peers.insert(from, peer_of(&m["data"]));
                                 }
                                 "leave" => {
                                     s.peers.remove(&from);
+                                    s.slots.remove(&from);
                                 }
                                 "presence" => {
                                     if let Some(p) = s.peers.get_mut(&from) {
@@ -278,7 +342,24 @@ impl Live {
             let _ = w.add_event_listener_with_callback("pagehide", closure.as_ref().unchecked_ref());
         }
         closure.forget();
+        // Changes not saved yet (the automatic save waits for a quiet moment): ask before leaving.
+        // OfficeHub asks the page the same way before going back.
+        let shared = self.shared.clone();
+        let unsaved = wasm_bindgen::closure::Closure::<dyn FnMut(web_sys::Event)>::new(move |e: web_sys::Event| {
+            let s = shared.borrow();
+            if s.changed_at.is_some() || s.saving || !s.outbox.is_empty() || s.sending {
+                e.prevent_default();
+            }
+        });
+        if let Some(w) = web_sys::window() {
+            let _ = w.add_event_listener_with_callback("beforeunload", unsaved.as_ref().unchecked_ref());
+        }
+        unsaved.forget();
     }
+}
+
+fn slot_of(v: &Value) -> (u32, bool) {
+    (v["slot"].as_u64().and_then(|n| u32::try_from(n).ok()).unwrap_or(u32::MAX), v["can_write"].as_bool().unwrap_or(false))
 }
 
 fn peer_of(v: &Value) -> RemotePeer {
