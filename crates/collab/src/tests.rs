@@ -253,3 +253,75 @@ fn a_shape_deleted_and_added_back_is_shared_again() {
     peers[1].receive(&a);
     assert!(same(&peers[0].p, &peers[1].p));
 }
+
+/// The first shape with text on the first slide, as (index, text).
+fn text_shape(p: &Presentation) -> usize {
+    p.slides[0].shapes.iter().position(|s| s.text.as_ref().is_some_and(|t| !t.text().is_empty())).unwrap()
+}
+
+fn text_of(p: &Presentation, i: usize) -> String {
+    p.slides[0].shapes[i].text.as_ref().unwrap().text()
+}
+
+fn set_text(p: &mut Presentation, i: usize, f: impl FnOnce(&mut String)) {
+    let body = slide_mut(p, 0).shapes[i].text.as_mut().unwrap();
+    let para = &mut body.paragraphs[0];
+    let mut t = para.runs[0].text.clone();
+    f(&mut t);
+    para.runs[0].text = t;
+}
+
+#[test]
+fn two_people_typing_in_the_same_text_box_keep_both() {
+    let mut peers = session(2);
+    let i = text_shape(&peers[0].p);
+    let before = text_of(&peers[0].p, i);
+    let a = peers[0].edit(|p| set_text(p, i, |t| t.insert_str(0, "A-")));
+    let b = peers[1].edit(|p| set_text(p, i, |t| t.push_str("-B")));
+    peers[0].receive(&b);
+    peers[1].receive(&a);
+    assert!(same(&peers[0].p, &peers[1].p));
+    let after = text_of(&peers[0].p, i);
+    assert!(after.starts_with("A-") && after.contains(&before) && after.split('\n').next().unwrap().ends_with("-B"), "{after:?}");
+}
+
+#[test]
+fn bold_by_one_and_typing_by_the_other_both_stay() {
+    let mut peers = session(2);
+    let i = text_shape(&peers[0].p);
+    let a = peers[0].edit(|p| {
+        let run = &mut slide_mut(p, 0).shapes[i].text.as_mut().unwrap().paragraphs[0].runs[0];
+        run.props.bold = Some(true);
+    });
+    let b = peers[1].edit(|p| set_text(p, i, |t| t.push('!')));
+    peers[0].receive(&b);
+    peers[1].receive(&a);
+    assert!(same(&peers[0].p, &peers[1].p));
+    let para = &peers[0].p.slides[0].shapes[i].text.as_ref().unwrap().paragraphs[0];
+    assert!(para.text().ends_with('!'));
+    assert!(para.runs.iter().any(|r| r.props.bold == Some(true)));
+}
+
+#[test]
+fn text_round_trips_exactly() {
+    // Every text body of the sample deck survives the trip through the shared document.
+    let peers = session(2);
+    for (a, b) in peers[0].p.slides.iter().zip(&peers[1].p.slides) {
+        assert_eq!(a.notes, b.notes);
+        for (x, y) in a.shapes.iter().zip(&b.shapes) {
+            assert_eq!(x.text, y.text, "shape {}", x.name);
+        }
+    }
+}
+
+#[test]
+fn the_caret_moves_with_text_typed_before_it() {
+    let mut peers = session(2);
+    let i = text_shape(&peers[0].p);
+    let slide = peers[0].p.slides[0].id;
+    let shape = peers[0].p.slides[0].shapes[i].id;
+    let anchors = peers[1].c.text_anchors(slide, Some(shape), &[(0, 2)]);
+    let a = peers[0].edit(|p| set_text(p, i, |t| t.insert_str(0, "xyz")));
+    peers[1].receive(&a);
+    assert_eq!(peers[1].c.text_positions(slide, Some(shape), &anchors), vec![Some((0, 5))]);
+}

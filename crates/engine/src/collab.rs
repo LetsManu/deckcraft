@@ -8,8 +8,8 @@
 
 use std::sync::Arc;
 
-pub use deckcraft_collab::merge;
 use deckcraft_collab::Collab;
+pub use deckcraft_collab::merge;
 
 use crate::{EngineError, Result, Session, clamp_selection};
 
@@ -134,11 +134,29 @@ impl Session {
         let st = self.active_mut().ok_or(EngineError::NoDocument)?;
         let doc = st.doc.clone();
         let Some(c) = st.shared.collab.as_mut() else { return Ok(()) };
+        // Our own edits first, so the caret below is counted in the text as we see it.
+        if let Some(u) = c.local(&doc) {
+            st.shared.outbox.push(u);
+        }
+        // Where we are typing: anchors that move when others type before them.
+        let typing = st.selection.text.as_ref().filter(|t| t.cell.is_none()).and_then(|t| {
+            let slide = doc.slides.get(st.selection.slide)?.id;
+            let shape = (!t.notes).then_some(t.shape);
+            Some((slide, shape, c.text_anchors(slide, shape, &[t.anchor, t.caret])))
+        });
         let (p, pending) = c.remote(update, &doc).map_err(|e| EngineError::Other(e.to_string()))?;
         if let Some(u) = pending {
             st.shared.outbox.push(u);
         }
         if !Arc::ptr_eq(&p, &st.doc) {
+            if let Some((slide, shape, anchors)) = typing
+                && let [Some(anchor), Some(caret)] = c.text_positions(slide, shape, &anchors)[..]
+                && let Some(t) = st.selection.text.as_mut()
+            {
+                t.anchor = anchor;
+                t.caret = caret;
+                t.line_end = None;
+            }
             // The undo snapshots no longer match; shared undo works on the shared document.
             st.doc = p;
             st.revision += 1;
@@ -194,6 +212,28 @@ mod tests {
         sync(&mut a, &mut b);
         sync(&mut b, &mut a);
         assert!(same(&a, &b));
+    }
+
+    #[test]
+    fn typing_together_in_one_text_box() {
+        let (mut a, mut b) = two();
+        // Both edit the title of the first slide: A types at the start, B at the end.
+        let shape = a.active().unwrap().doc.slides[0].shapes[0].id;
+        a.execute("text.edit", &json!({"id": shape.0, "at": [0, 0]})).unwrap();
+        b.execute("text.edit", &json!({"id": shape.0, "end": true})).unwrap();
+        a.execute("text.insert", &json!({"text": "Hello "})).unwrap();
+        b.execute("text.insert", &json!({"text": " world"})).unwrap();
+        sync(&mut a, &mut b);
+        sync(&mut b, &mut a);
+        sync(&mut a, &mut b);
+        assert!(same(&a, &b));
+        let text = a.active().unwrap().doc.slides[0].shapes[0].text.as_ref().unwrap().text();
+        assert!(text.starts_with("Hello ") && text.ends_with(" world"), "{text:?}");
+        // B keeps typing where B was.
+        b.execute("text.insert", &json!({"text": "!"})).unwrap();
+        sync(&mut b, &mut a);
+        let text = a.active().unwrap().doc.slides[0].shapes[0].text.as_ref().unwrap().text();
+        assert!(text.ends_with(" world!"), "{text:?}");
     }
 
     #[test]

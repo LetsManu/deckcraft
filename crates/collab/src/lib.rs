@@ -21,6 +21,7 @@
 //! | `zorder` (map) | slide id | the slide's shape ids, back to front, as JSON |
 //! | `media` (map) | media id | the media item without its bytes, as JSON |
 //! | `blobs` (map) | media id | the media bytes |
+//! | `texts` (map) | `slide/shape`, `n:slide` | a shape's or the speaker notes' paragraphs as rich text ([`text`]) |
 //!
 //! Everything a person can change at once (a shape, a slide's own settings, one presentation
 //! field) is one entry, so two people changing different shapes never interfere and the same shape
@@ -33,15 +34,20 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+mod text;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use deckcraft_model::text::Paragraph;
 use deckcraft_model::{MediaItem, Presentation, Shape, ShapeId, Slide, SlideId};
 use serde_json::Value;
 use yrs::types::ToJson;
 use yrs::undo::{Options as UndoOptions, UndoManager};
 use yrs::updates::decoder::Decode;
-use yrs::{Any, Array, ArrayRef, Doc, Map, MapRef, Origin, Out, ReadTxn, StateVector, Transact, TransactionMut, Update};
+use yrs::{
+    Any, Array, ArrayRef, Doc, Map, MapRef, Origin, Out, ReadTxn, StateVector, StickyIndex, TextPrelim, TextRef, Transact, TransactionMut, Update,
+};
 
 /// Origin of this replica's own edits: only these are undone by [`Collab::undo`].
 const LOCAL: &str = "deckcraft-local";
@@ -73,6 +79,7 @@ pub struct Collab {
     zorder: MapRef,
     media: MapRef,
     blobs: MapRef,
+    texts: MapRef,
     /// The presentation as the shared document describes it right now (after the last local diff
     /// or remote merge).
     synced: Option<Arc<Presentation>>,
@@ -144,14 +151,37 @@ fn same_meta(a: &Presentation, b: &Presentation) -> bool {
     strip(a) == strip(b)
 }
 
-/// A slide as shared in `slides`: without its shapes.
+/// A slide as shared in `slides`: without its shapes and the text of its notes (`texts`).
 fn slide_json(s: &Slide) -> Option<String> {
-    let mut v = serde_json::to_value(s).ok()?;
-    if let Value::Object(m) = &mut v {
-        m.remove("shapes");
-    }
-    serde_json::to_string(&v).ok()
+    let mut q = Slide { shapes: Vec::new(), ..s.clone() };
+    q.notes.paragraphs.clear();
+    serde_json::to_string(&q).ok()
 }
+
+/// A top-level shape as shared in `shapes`: without its own text (`texts`).
+fn shape_json(sh: &Shape) -> Option<String> {
+    let mut q = sh.clone();
+    if let Some(t) = &mut q.text {
+        t.paragraphs.clear();
+    }
+    to_json(&q)
+}
+
+fn paragraphs(sh: &Shape) -> &[Paragraph] {
+    sh.text.as_ref().map(|t| t.paragraphs.as_slice()).unwrap_or(&[])
+}
+
+/// The `texts` entry of a shape's text (`None`: the slide's speaker notes).
+fn text_key(slide: SlideId, shape: Option<ShapeId>) -> String {
+    match shape {
+        Some(sh) => shape_key(slide, sh),
+        None => format!("n:{}", slide.0),
+    }
+}
+
+/// A caret or selection end inside a shared text; it moves with the text when others type.
+#[derive(Clone, Debug)]
+pub struct TextAnchor(StickyIndex);
 
 /// A media item as shared in `media`: without its bytes (they go to `blobs`).
 fn media_json(m: &MediaItem) -> Option<String> {
@@ -180,7 +210,7 @@ impl Collab {
             init_undo_stack: Vec::new(),
             init_redo_stack: Vec::new(),
         });
-        for name in ["meta", "order", "slides", "shapes", "zorder", "media", "blobs"] {
+        for name in ["meta", "order", "slides", "shapes", "zorder", "media", "blobs", "texts"] {
             let root = doc.get_or_insert_map(name);
             if name == "order" {
                 undo.expand_scope(&doc, &doc.get_or_insert_array(name));
@@ -196,6 +226,7 @@ impl Collab {
             zorder: doc.get_or_insert_map("zorder"),
             media: doc.get_or_insert_map("media"),
             blobs: doc.get_or_insert_map("blobs"),
+            texts: doc.get_or_insert_map("texts"),
             doc,
             synced: None,
             seen: HashMap::new(),
@@ -352,6 +383,10 @@ impl Collab {
                 let slides = self.slides.clone();
                 self.put(txn, &slides, "slide", &s.id.0.to_string(), json);
             }
+            let old_notes = prev.map(|o| o.notes.paragraphs.as_slice()).unwrap_or(&[]);
+            if prev.is_none() || old_notes != s.notes.paragraphs.as_slice() {
+                self.write_text(txn, &text_key(s.id, None), old_notes, &s.notes.paragraphs);
+            }
             let prev_shapes: HashMap<ShapeId, &Shape> = prev.map(|o| o.shapes.iter().map(|sh| (sh.id, sh)).collect()).unwrap_or_default();
             let mut ids = Vec::with_capacity(s.shapes.len());
             for sh in &s.shapes {
@@ -359,15 +394,20 @@ impl Collab {
                 if prev_shapes.get(&sh.id).is_some_and(|o| *o == sh) && self.seen.contains_key(&format!("shape:{}", shape_key(s.id, sh.id))) {
                     continue;
                 }
-                if let Some(json) = to_json(sh) {
+                if let Some(json) = shape_json(sh) {
                     let shapes = self.shapes.clone();
                     self.put(txn, &shapes, "shape", &shape_key(s.id, sh.id), json);
+                }
+                let old_text = prev_shapes.get(&sh.id).map(|o| paragraphs(o));
+                if old_text != Some(paragraphs(sh)) {
+                    self.write_text(txn, &text_key(s.id, Some(sh.id)), old_text.unwrap_or(&[]), paragraphs(sh));
                 }
             }
             let kept: HashSet<u32> = ids.iter().copied().collect();
             let shapes = self.shapes.clone();
             for gone in prev_shapes.keys().filter(|id| !kept.contains(&id.0)) {
                 self.drop_key(txn, &shapes, "shape", &shape_key(s.id, *gone));
+                self.texts.remove(txn, &text_key(s.id, Some(*gone)));
             }
             if let Some(json) = to_json(&ids) {
                 let zorder = self.zorder.clone();
@@ -379,12 +419,70 @@ impl Collab {
             let key = o.id.0.to_string();
             self.drop_key(txn, &slides, "slide", &key);
             self.drop_key(txn, &zorder, "zorder", &key);
+            self.texts.remove(txn, &text_key(o.id, None));
             for sh in &o.shapes {
                 self.drop_key(txn, &shapes, "shape", &shape_key(o.id, sh.id));
+                self.texts.remove(txn, &text_key(o.id, Some(sh.id)));
             }
         }
         let target: Vec<u32> = new.slides.iter().map(|s| s.id.0).collect();
         self.write_order(txn, &target);
+    }
+
+    /// Bring the shared text `key` from `old` to `new` (created when it does not exist yet).
+    fn write_text(&mut self, txn: &mut TransactionMut, key: &str, old: &[Paragraph], new: &[Paragraph]) {
+        match self.texts.get(txn, key) {
+            Some(Out::YText(t)) => text::write(txn, &t, old, new),
+            _ => {
+                let t: TextRef = self.texts.insert(txn, key, TextPrelim::new(""));
+                text::write(txn, &t, &[], new);
+            }
+        }
+    }
+
+    fn text_ref<T: ReadTxn>(&self, txn: &T, key: &str) -> Option<TextRef> {
+        match self.texts.get(txn, key) {
+            Some(Out::YText(t)) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// Fill in the slide's texts from the shared document (only what differs is copied).
+    fn fill_texts<T: ReadTxn>(&self, txn: &T, slide: &mut Arc<Slide>) {
+        let id = slide.id;
+        if let Some(t) = self.text_ref(txn, &text_key(id, None)) {
+            let notes = text::read(txn, &t);
+            if slide.notes.paragraphs != notes {
+                Arc::make_mut(slide).notes.paragraphs = notes;
+            }
+        }
+        for i in 0..slide.shapes.len() {
+            let Some(sh) = slide.shapes.get(i) else { continue };
+            if sh.text.is_none() {
+                continue;
+            }
+            let Some(t) = self.text_ref(txn, &text_key(id, Some(sh.id))) else { continue };
+            let paras = text::read(txn, &t);
+            if paragraphs(sh) != paras.as_slice()
+                && let Some(body) = Arc::make_mut(slide).shapes.get_mut(i).and_then(|s| s.text.as_mut())
+            {
+                body.paragraphs = paras;
+            }
+        }
+    }
+
+    /// Anchors for positions in a shape's text (or the notes with `shape: None`) that follow the
+    /// text when others type before them ([`Self::text_positions`] reads them back).
+    pub fn text_anchors(&self, slide: SlideId, shape: Option<ShapeId>, positions: &[(usize, usize)]) -> Vec<Option<TextAnchor>> {
+        let txn = self.doc.transact();
+        let Some(t) = self.text_ref(&txn, &text_key(slide, shape)) else { return vec![None; positions.len()] };
+        positions.iter().map(|p| text::anchor(&txn, &t, *p).map(TextAnchor)).collect()
+    }
+
+    pub fn text_positions(&self, slide: SlideId, shape: Option<ShapeId>, anchors: &[Option<TextAnchor>]) -> Vec<Option<(usize, usize)>> {
+        let txn = self.doc.transact();
+        let Some(t) = self.text_ref(&txn, &text_key(slide, shape)) else { return vec![None; anchors.len()] };
+        anchors.iter().map(|a| a.as_ref().and_then(|a| text::resolve(&txn, &t, &a.0))).collect()
     }
 
     /// Edit the shared slide order into `target` with as few moves as possible, so concurrent
@@ -549,7 +647,9 @@ impl Collab {
                 }
             }
             if !changed && let Some(prev) = prev {
-                p.slides.push((*prev).clone());
+                let mut slide = (*prev).clone();
+                self.fill_texts(&txn, &mut slide);
+                p.slides.push(slide);
                 continue;
             }
             // Rebuild this slide.
@@ -578,7 +678,9 @@ impl Collab {
             if let Some(z) = order_json {
                 self.seen.insert(zorder_key, z);
             }
-            p.slides.push(Arc::new(slide));
+            let mut slide = Arc::new(slide);
+            self.fill_texts(&txn, &mut slide);
+            p.slides.push(slide);
         }
 
         // Media (bytes from `blobs`; unchanged ones keep their `Arc` from `base`).
