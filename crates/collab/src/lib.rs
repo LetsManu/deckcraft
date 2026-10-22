@@ -21,7 +21,12 @@
 //! | `zorder` (map) | slide id | the slide's shape ids, back to front, as JSON |
 //! | `media` (map) | media id | the media item without its bytes, as JSON |
 //! | `blobs` (map) | media id | the media bytes |
-//! | `texts` (map) | `slide/shape`, `n:slide` | a shape's or the speaker notes' paragraphs as rich text ([`text`]) |
+//! | `texts` (map) | `slide/shape`, `n:slide`, `c:cell` | a shape's, the speaker notes' or a table cell's paragraphs as rich text ([`text`]) |
+//!
+//! A table's cells keep their text in `texts` too, each under an id of its own that the table's
+//! `shapes` entry lists (`collabCells`, by row and column). So people type in different cells,
+//! even the same cell, at once; a change of the table itself (a new row, a wider column) is a
+//! change of the shape (the last one wins), and the cells keep their texts through it.
 //!
 //! Everything a person can change at once (a shape, a slide's own settings, one presentation
 //! field) is one entry, so two people changing different shapes never interfere and the same shape
@@ -39,8 +44,9 @@ mod text;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use deckcraft_model::table::Table;
 use deckcraft_model::text::Paragraph;
-use deckcraft_model::{MediaItem, Presentation, Shape, ShapeId, Slide, SlideId};
+use deckcraft_model::{MediaItem, Presentation, Shape, ShapeId, ShapeKind, Slide, SlideId};
 use serde_json::Value;
 use yrs::types::ToJson;
 use yrs::undo::{Options as UndoOptions, UndoManager};
@@ -92,6 +98,9 @@ pub struct Collab {
     undo: UndoManager<()>,
     /// Where this person's caret is (`texts` key and `(paragraph, char)`), for [`text::write`].
     caret: Option<(String, (usize, usize))>,
+    /// Names new table cells' texts: this replica's client id and a counter.
+    client: u64,
+    next_cell: u64,
 }
 
 impl std::fmt::Debug for Collab {
@@ -160,13 +169,58 @@ fn slide_json(s: &Slide) -> Option<String> {
     serde_json::to_string(&q).ok()
 }
 
-/// A top-level shape as shared in `shapes`: without its own text (`texts`).
-fn shape_json(sh: &Shape) -> Option<String> {
+/// The key in a table's `shapes` entry that lists its cells' text ids.
+const CELLS: &str = "collabCells";
+
+fn table_of(sh: &Shape) -> Option<&Table> {
+    match &sh.kind {
+        ShapeKind::Table(t) => Some(t),
+        _ => None,
+    }
+}
+
+/// A top-level shape as shared in `shapes`: without its own text (`texts`); a table also without
+/// its cells' texts, listing their ids instead.
+fn shape_json(sh: &Shape, cells: Option<&Vec<Vec<String>>>) -> Option<String> {
     let mut q = sh.clone();
     if let Some(t) = &mut q.text {
         t.paragraphs.clear();
     }
-    to_json(&q)
+    let Some(ids) = cells else { return to_json(&q) };
+    if let ShapeKind::Table(t) = &mut q.kind {
+        for cell in t.rows.iter_mut().flat_map(|r| r.cells.iter_mut()) {
+            cell.text.paragraphs.clear();
+        }
+    }
+    let mut v = serde_json::to_value(&q).ok()?;
+    if let Value::Object(m) = &mut v {
+        m.insert(CELLS.into(), serde_json::to_value(ids).ok()?);
+    }
+    serde_json::to_string(&v).ok()
+}
+
+/// The cell text ids a table's `shapes` entry lists.
+fn cell_ids(json: &str) -> Option<Vec<Vec<String>>> {
+    let v: Value = serde_json::from_str(json).ok()?;
+    serde_json::from_value(v.get(CELLS)?.clone()).ok()
+}
+
+/// Which old item each new one continues: equal ones at both ends, the rest in order.
+fn align<T: PartialEq>(old: &[T], new: &[T]) -> Vec<Option<usize>> {
+    let pre = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+    let max = old.len().min(new.len()) - pre;
+    let suf = old.iter().rev().zip(new.iter().rev()).take(max).take_while(|(a, b)| a == b).count();
+    let mut out = vec![None; new.len()];
+    for (i, slot) in out.iter_mut().enumerate() {
+        if i < pre {
+            *slot = Some(i);
+        } else if i >= new.len() - suf {
+            *slot = Some(old.len() - (new.len() - i));
+        } else if i - pre < old.len() - pre - suf {
+            *slot = Some(i);
+        }
+    }
+    out
 }
 
 fn paragraphs(sh: &Shape) -> &[Paragraph] {
@@ -237,6 +291,8 @@ impl Collab {
             id_ceiling: id_floor + ID_SPAN,
             undo,
             caret: None,
+            client: client_id & ((1 << 53) - 1),
+            next_cell: 0,
         }
     }
 
@@ -403,7 +459,11 @@ impl Collab {
                 if prev_shapes.get(&sh.id).is_some_and(|o| *o == sh) && self.seen.contains_key(&format!("shape:{}", shape_key(s.id, sh.id))) {
                     continue;
                 }
-                if let Some(json) = shape_json(sh) {
+                let cells = table_of(sh).map(|t| {
+                    let old = prev_shapes.get(&sh.id).and_then(|o| table_of(o));
+                    self.write_cells(txn, &shape_key(s.id, sh.id), old, t)
+                });
+                if let Some(json) = shape_json(sh, cells.as_ref()) {
                     let shapes = self.shapes.clone();
                     self.put(txn, &shapes, "shape", &shape_key(s.id, sh.id), json);
                 }
@@ -450,6 +510,41 @@ impl Collab {
         }
     }
 
+    /// Bring a table's cell texts up to date; returns the cells' text ids. Cells that stayed keep
+    /// their texts; new cells get new ones.
+    fn write_cells(&mut self, txn: &mut TransactionMut, key: &str, old: Option<&Table>, new: &Table) -> Vec<Vec<String>> {
+        let old_ids = get_str(&self.shapes, txn, key).and_then(|j| cell_ids(&j));
+        let old = old.zip(old_ids.as_ref());
+        let rows = old.map(|(t, _)| align(&t.rows, &new.rows)).unwrap_or_else(|| vec![None; new.rows.len()]);
+        let mut ids = Vec::with_capacity(new.rows.len());
+        for (r, row) in new.rows.iter().enumerate() {
+            let prev_row = rows.get(r).copied().flatten().and_then(|o| Some((o, old?.0.rows.get(o)?)));
+            let cells = prev_row.map(|(_, pr)| align(&pr.cells, &row.cells)).unwrap_or_else(|| vec![None; row.cells.len()]);
+            let mut rid = Vec::with_capacity(row.cells.len());
+            for (c, cell) in row.cells.iter().enumerate() {
+                let prev = prev_row.and_then(|(o, pr)| {
+                    let oc = cells.get(c).copied().flatten()?;
+                    Some((old?.1.get(o)?.get(oc)?.clone(), pr.cells.get(oc)?))
+                });
+                let (id, before) = match prev {
+                    Some((id, pc)) => (id, Some(pc.text.paragraphs.as_slice())),
+                    None => {
+                        self.next_cell = self.next_cell.saturating_add(1);
+                        (format!("{:x}.{}", self.client, self.next_cell), None)
+                    }
+                };
+                let text_key = format!("c:{id}");
+                if before != Some(cell.text.paragraphs.as_slice()) {
+                    let known = before.filter(|_| self.text_ref(txn, &text_key).is_some());
+                    self.write_text(txn, &text_key, known.unwrap_or(&[]), &cell.text.paragraphs);
+                }
+                rid.push(id);
+            }
+            ids.push(rid);
+        }
+        ids
+    }
+
     fn text_ref<T: ReadTxn>(&self, txn: &T, key: &str) -> Option<TextRef> {
         match self.texts.get(txn, key) {
             Some(Out::YText(t)) => Some(t),
@@ -468,6 +563,10 @@ impl Collab {
         }
         for i in 0..slide.shapes.len() {
             let Some(sh) = slide.shapes.get(i) else { continue };
+            if table_of(sh).is_some() {
+                self.fill_cells(txn, slide, i);
+                continue;
+            }
             if sh.text.is_none() {
                 continue;
             }
@@ -477,6 +576,33 @@ impl Collab {
                 && let Some(body) = Arc::make_mut(slide).shapes.get_mut(i).and_then(|s| s.text.as_mut())
             {
                 body.paragraphs = paras;
+            }
+        }
+    }
+
+    /// Fill in the cell texts of the table that is shape `i` of the slide.
+    fn fill_cells<T: ReadTxn>(&self, txn: &T, slide: &mut Arc<Slide>, i: usize) {
+        let Some(sh) = slide.shapes.get(i) else { return };
+        let Some(ids) = get_str(&self.shapes, txn, &shape_key(slide.id, sh.id)).and_then(|j| cell_ids(&j)) else { return };
+        let Some(table) = table_of(sh) else { return };
+        let mut changes = Vec::new();
+        for (r, row) in table.rows.iter().enumerate() {
+            for (c, cell) in row.cells.iter().enumerate() {
+                let Some(t) = ids.get(r).and_then(|x| x.get(c)).and_then(|id| self.text_ref(txn, &format!("c:{id}"))) else { continue };
+                let paras = text::read(txn, &t);
+                if cell.text.paragraphs != paras {
+                    changes.push((r, c, paras));
+                }
+            }
+        }
+        if changes.is_empty() {
+            return;
+        }
+        if let Some(ShapeKind::Table(t)) = Arc::make_mut(slide).shapes.get_mut(i).map(|s| &mut s.kind) {
+            for (r, c, paras) in changes {
+                if let Some(cell) = t.rows.get_mut(r).and_then(|x| x.cells.get_mut(c)) {
+                    cell.text.paragraphs = paras;
+                }
             }
         }
     }

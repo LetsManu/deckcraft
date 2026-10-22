@@ -325,3 +325,98 @@ fn the_caret_moves_with_text_typed_before_it() {
     peers[1].receive(&a);
     assert_eq!(peers[1].c.text_positions(slide, Some(shape), &anchors), vec![Some((0, 5))]);
 }
+
+fn add_table(p: &mut Presentation) -> usize {
+    let id = ShapeId(p.next_id);
+    p.next_id += 1;
+    let sh = Shape { id, kind: ShapeKind::Table(deckcraft_model::table::Table::new(2, 2, 300.0, 40.0)), ..Default::default() };
+    let slide = slide_mut(p, 0);
+    slide.shapes.push(sh);
+    slide.shapes.len() - 1
+}
+
+fn table_mut(p: &mut Presentation, i: usize) -> &mut deckcraft_model::table::Table {
+    match &mut slide_mut(p, 0).shapes[i].kind {
+        ShapeKind::Table(t) => t,
+        _ => panic!("not a table"),
+    }
+}
+
+fn cell_text(p: &Presentation, i: usize, r: usize, c: usize) -> String {
+    match &p.slides[0].shapes[i].kind {
+        ShapeKind::Table(t) => t.rows[r].cells[c].text.text(),
+        _ => panic!("not a table"),
+    }
+}
+
+fn type_in_cell(p: &mut Presentation, i: usize, r: usize, c: usize, at: usize, s: &str) {
+    let cell = &mut table_mut(p, i).rows[r].cells[c];
+    if cell.text.paragraphs.is_empty() {
+        cell.text.paragraphs.push(deckcraft_model::text::Paragraph::new(""));
+    }
+    let para = &mut cell.text.paragraphs[0];
+    if para.runs.is_empty() {
+        para.runs.push(deckcraft_model::text::Run::new(""));
+    }
+    para.runs[0].text.insert_str(at, s);
+}
+
+#[test]
+fn typing_in_table_cells_at_once_keeps_everything() {
+    let mut peers = session(2);
+    let mut at = 0;
+    let u = peers[0].edit(|p| at = add_table(p));
+    peers[1].receive(&u);
+    assert!(same(&peers[0].p, &peers[1].p));
+    let a = peers[0].edit(|p| type_in_cell(p, at, 0, 0, 0, "Name"));
+    let b = peers[1].edit(|p| type_in_cell(p, at, 1, 1, 0, "42"));
+    peers[0].receive(&b);
+    peers[1].receive(&a);
+    assert!(same(&peers[0].p, &peers[1].p));
+    assert_eq!(cell_text(&peers[0].p, at, 0, 0), "Name");
+    assert_eq!(cell_text(&peers[0].p, at, 1, 1), "42");
+    // The same cell, both at once.
+    let a = peers[0].edit(|p| type_in_cell(p, at, 0, 0, 4, "s"));
+    let b = peers[1].edit(|p| type_in_cell(p, at, 0, 0, 0, "First "));
+    peers[0].receive(&b);
+    peers[1].receive(&a);
+    assert!(same(&peers[0].p, &peers[1].p));
+    assert_eq!(cell_text(&peers[0].p, at, 0, 0), "First Names");
+}
+
+#[test]
+fn a_new_row_and_typing_in_a_cell_both_stay() {
+    let mut peers = session(2);
+    let mut at = 0;
+    let u = peers[0].edit(|p| {
+        at = add_table(p);
+        type_in_cell(p, at, 0, 0, 0, "Head");
+    });
+    peers[1].receive(&u);
+    peers[0].c.step();
+    let a = peers[0].edit(|p| {
+        let t = table_mut(p, at);
+        let row =
+            deckcraft_model::table::Row { height: 40.0, cells: vec![deckcraft_model::table::Cell::new(""), deckcraft_model::table::Cell::new("")] };
+        t.rows.push(row);
+    });
+    let b = peers[1].edit(|p| type_in_cell(p, at, 1, 0, 0, "Body"));
+    peers[0].receive(&b);
+    peers[1].receive(&a);
+    assert!(same(&peers[0].p, &peers[1].p));
+    let t = match &peers[0].p.slides[0].shapes[at].kind {
+        ShapeKind::Table(t) => t.clone(),
+        _ => panic!(),
+    };
+    assert_eq!(t.rows.len(), 3);
+    assert_eq!(cell_text(&peers[0].p, at, 0, 0), "Head");
+    assert_eq!(cell_text(&peers[0].p, at, 1, 0), "Body");
+    // Undo takes back only the new row.
+    let cur = peers[0].p.clone();
+    peers[0].c.step();
+    let (p, u) = peers[0].c.undo(&cur, false).unwrap().unwrap();
+    peers[0].p = p;
+    peers[1].receive(&u);
+    assert!(same(&peers[0].p, &peers[1].p));
+    assert_eq!(cell_text(&peers[1].p, at, 1, 0), "Body");
+}
