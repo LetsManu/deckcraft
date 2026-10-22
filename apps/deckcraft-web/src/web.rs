@@ -64,7 +64,7 @@ pub fn start() {
                     if q.contains("show") {
                         app.start_show(0, false);
                     }
-                    Ok(Box::new(WebShell { app, inbox, live: crate::live::Live::from_portal() }))
+                    Ok(Box::new(WebShell { app, inbox, live: crate::live::Live::from_portal(), sized: false }))
                 }),
             )
             .await;
@@ -88,7 +88,13 @@ struct WebShell {
     inbox: Inbox,
     /// OfficeHub: editing together with others (`?collab=`).
     live: Option<crate::live::Live>,
+    /// The panes were fitted to a narrow screen (a phone) once.
+    sized: bool,
 }
+
+/// Screens narrower than this (in points) are phones: the slide gets the room, the thumbnails a
+/// narrow strip and the notes stay closed.
+const NARROW: f32 = 700.0;
 
 /// eframe can leave the canvas at its size in CSS pixels on screens with more than one pixel per
 /// point (phones, Retina displays): the interface is then drawn several times too large and cut
@@ -115,6 +121,17 @@ fn fit_canvas(ctx: &egui::Context) {
 impl eframe::App for WebShell {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         fit_canvas(ctx);
+        if !self.sized && ctx.content_rect().width() > 1.0 {
+            self.sized = true;
+            if ctx.content_rect().width() < NARROW {
+                self.app.ui.thumbs_width = 72.0;
+                self.app.ui.notes = false;
+                self.app.ui.ribbon_collapsed = true;
+                if let Err(e) = self.app.run("view.fit", serde_json::json!({})) {
+                    log::warn!("narrow screen: {e}");
+                }
+            }
+        }
         let dropped = ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
         for f in dropped {
             // Capture the document and slide now. The bytes arrive later, after the user may
