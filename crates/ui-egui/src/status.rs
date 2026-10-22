@@ -12,6 +12,8 @@ pub fn status_bar(app: &mut SlideApp, ui: &mut Ui) {
     let t = Tokens::get(ui.ctx());
     egui::Panel::bottom("status").exact_size(28.0).frame(egui::Frame::NONE.fill(t.chrome)).show(ui, |ui| {
         let rect = ui.max_rect();
+        // A phone: only the slide number and the zoom fit; the rest would overlap.
+        let narrow = rect.width() < 700.0;
         let Some(st) = app.session.active() else { return };
         let n = st.doc.slides.len();
         let left = match st.selection.target {
@@ -21,14 +23,16 @@ pub fn status_bar(app: &mut SlideApp, ui: &mut Ui) {
         let p = ui.painter();
         p.text(pos2(rect.min.x + 14.0, rect.center().y), Align2::LEFT_CENTER, &left, theme::font(12.0), t.text_dim);
         // The selection's proofing language; a click opens Review › Language.
-        let (lang, no_proof) = crate::dialogs::selected_language(app);
-        let name = crate::squiggles::lang_name(&lang) + if no_proof { " (not checked)" } else { "" };
-        let lr = p.text(pos2(rect.min.x + 120.0, rect.center().y), Align2::LEFT_CENTER, &name, theme::font(12.0), t.text_dim);
-        if ui.interact(lr.expand(3.0), ui.id().with("status_lang"), Sense::click()).on_hover_text("Language").clicked() {
-            app.dialog = Some(crate::dialogs::Dialog::new("language"));
+        if !narrow {
+            let (lang, no_proof) = crate::dialogs::selected_language(app);
+            let name = crate::squiggles::lang_name(&lang) + if no_proof { " (not checked)" } else { "" };
+            let lr = p.text(pos2(rect.min.x + 120.0, rect.center().y), Align2::LEFT_CENTER, &name, theme::font(12.0), t.text_dim);
+            if ui.interact(lr.expand(3.0), ui.id().with("status_lang"), Sense::click()).on_hover_text("Language").clicked() {
+                app.dialog = Some(crate::dialogs::Dialog::new("language"));
+            }
         }
         // Transient status message.
-        if let Some(msg) = app.fresh_status() {
+        if let Some(msg) = app.fresh_status().filter(|_| !narrow) {
             p.text(pos2(rect.min.x + 290.0, rect.center().y), Align2::LEFT_CENTER, &msg, theme::font(12.0), t.accent);
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
         }
@@ -48,6 +52,9 @@ pub fn status_bar(app: &mut SlideApp, ui: &mut Ui) {
         }
         if small_icon(&mut right, Icon::ZoomIn, "Zoom In", false).clicked() {
             let _ = app.run("view.zoomIn", json!({}));
+        }
+        if narrow {
+            return;
         }
         // Slider 10%–400% (log scale).
         let mut z = app.ui.zoom.unwrap_or(app.canvas_scale).clamp(0.1, 4.0);

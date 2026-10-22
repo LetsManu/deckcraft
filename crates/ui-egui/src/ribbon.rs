@@ -77,7 +77,10 @@ pub fn title_bar(app: &mut SlideApp, ui: &mut Ui) {
         crate::qat::show(app, &mut child);
         let title =
             app.session.active().map(|d| format!("{}{}", d.title(), if dirty { " — Edited" } else { "" })).unwrap_or_else(|| "DeckCraft".into());
-        ui.painter().text(rect.center(), Align2::CENTER_CENTER, title, theme::font(13.0), t.text);
+        // Between the quick access buttons and the right side only when there is room (not on a phone).
+        if rect.width() >= left + 420.0 + 320.0 + 160.0 {
+            ui.painter().text(rect.center(), Align2::CENTER_CENTER, title, theme::font(13.0), t.text);
+        }
         // Right side.
         let mut right = ui.new_child(
             egui::UiBuilder::new()
