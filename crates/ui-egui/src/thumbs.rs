@@ -18,7 +18,8 @@ pub fn show(app: &mut SlideApp, ui: &mut Ui) {
     let panel = egui::Panel::left("thumbs")
         .resizable(true)
         .default_size(app.ui.thumbs_width)
-        .size_range(150.0..=420.0)
+        // A phone's screen leaves room for a narrow strip only
+        .size_range(if ui.ctx().content_rect().width() < 700.0 { 60.0 } else { 150.0 }..=420.0)
         .frame(egui::Frame::NONE.fill(t.chrome))
         .show(ui, |ui| {
             app.ui.thumbs_width = ui.available_width();
